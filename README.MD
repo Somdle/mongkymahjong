@@ -1,5 +1,7 @@
 ## 마장 점수 기록
 
+### python 3.13 버전(Eos 2029.10.) 사용
+
 ### MSA (RESTful API가 기본 API)
 - 0. Core Service (중앙 관제)
   - 0.1. 사용자 CRUD
