@@ -1,0 +1,19 @@
+# compose.yaml
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # 컨테이너 환경에 .env 값을 주입
+    env_file:
+      - .env
+    # 필요한 경우 개별 오버라이드도 가능
+    environment:
+      TZ: Asia/Seoul
+    restart: unless-stopped
+    # 표준 로그 롤링
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
