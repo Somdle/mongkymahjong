@@ -1,7 +1,8 @@
-# bot.py
+# app.py  (전체 코드)
 
 import os
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Iterable
+from collections import defaultdict
 from datetime import datetime, timezone
 
 import aiomysql  # pip install aiomysql python-dotenv discord.py
@@ -23,23 +24,33 @@ DB_USER = os.getenv("DB_USER", "monkeymahjong")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "monkeymahjong1324~")
 DB_NAME = os.getenv("DB_NAME", "monkeymahjong")
 
-TARGET_TOTAL = 100000  # 총합 검증 값
-
 if not BOT_TOKEN or CHANNEL_ID == 0:
     raise RuntimeError("DISCORD_BOT_TOKEN / DISCORD_CHANNEL_ID 필요")
 
-# 좌석 및 타이브레이크
+# ── 마작 점수 상수 ────────────────────────────────────────────────────────────
+START_POINTS = 25_000                   # 시작 점수
+TARGET_TOTAL = 100_000                  # 4인 합계 검증
+UMA_BY_RANK = {1: 15, 2: 5, 3: -5, 4: -15}  # 1위~4위 우마 15/5/-5/-15
 POS_LABEL = {0: "동", 1: "서", 2: "남", 3: "북"}
-LABEL_ORDER_FOR_INPUT = [0, 1, 2, 3]
-TIEBREAK_ESWN = {0: 0, 2: 1, 1: 2, 3: 3}  # 동→남→서→북
+# 동점 타이브레이크: ESWN(동(0)→남(2)→서(1)→북(3)) 우선
+TIEBREAK_ESWN = {0: 0, 2: 1, 1: 2, 3: 3}
 
-def rank_key(score: int, pos: int) -> Tuple[int, int]:
+def rank_sort_key(score: int, pos: int) -> Tuple[int, int]:
+    """점수 내림차순, 동점 시 ESWN 우선순위."""
     return (-score, TIEBREAK_ESWN[pos])
+
+def calc_hanchan_points(end_points: int, rank: int) -> float:
+    """
+    리치 마작 대회 점수(반장 포인트):
+    ((종료점수 - 25,000) / 1,000) + 우마(rank). 1위 +15, 2위 +5, 3위 -5, 4위 -15.
+    """
+    base = (end_points - START_POINTS) / 1000.0
+    return base + UMA_BY_RANK[rank]
 
 def mention(uid: int) -> str:
     return f"<@{uid}>"
 
-# ── DB ────────────────────────────────────────────────────────────────────────
+# ── DB 유틸 ───────────────────────────────────────────────────────────────────
 async def fetch_game(pool: aiomysql.Pool, game_id: int) -> List[Dict[str, Any]]:
     async with pool.acquire() as conn, conn.cursor() as cur:
         await cur.execute(
@@ -61,33 +72,56 @@ async def delete_game(pool: aiomysql.Pool, game_id: int) -> None:
             await conn.rollback()
             raise
 
+async def fetch_all_details(pool: aiomysql.Pool) -> List[Tuple[int, int, int, int]]:
+    """모든 game_detail: (game_id, user_id, score, position)"""
+    async with pool.acquire() as conn, conn.cursor() as cur:
+        await cur.execute("SELECT game_id, user_id, score, position FROM game_detail ORDER BY game_id ASC")
+        rows = await cur.fetchall()
+    return [(int(g), int(u), int(s), int(p)) for (g, u, s, p) in rows]
+
 # ── 임베드 ────────────────────────────────────────────────────────────────────
 def build_game_embed(game_id: int, rows: List[Dict[str, Any]], *, title_prefix: str = "게임 결과") -> discord.Embed:
+    """
+    공개용 임베드:
+      - 좌석별: 멘션, 원점수, 계산점(+/-) 표시
+      - 하단: 원점수 기준 순위(동점 ESWN)
+    """
     embed = discord.Embed(
         title=f"{title_prefix} #{game_id}",
-        description="동점 시 ESWN(동→남→서→북) 순",
+        description="계산식: ((종료점수-25,000)/1,000)+우마 [1위+15, 2위+5, 3위-5, 4위-15] • 동점 ESWN(동→남→서→북)",
         colour=discord.Colour.blue(),
         timestamp=datetime.now(timezone.utc),
     )
-    total = 0
+
+    total_raw = 0
+    # 순위 산출을 위해 점수 정렬
+    sorted_rows = sorted(rows, key=lambda r: rank_sort_key(r["score"], r["position"]))
+    # user_id -> rank
+    rank_by_uid: Dict[int, int] = {r["user_id"]: i+1 for i, r in enumerate(sorted_rows)}
+
+    # 좌석표시는 좌석 순서대로
     by_pos = {r["position"]: r for r in rows}
     for p in [0, 1, 2, 3]:
         r = by_pos.get(p)
         if not r:
             continue
-        total += r["score"]
+        uid = int(r["user_id"]); raw = int(r["score"])
+        rk = rank_by_uid[uid]
+        hp = calc_hanchan_points(raw, rk)
+        total_raw += raw
         embed.add_field(
             name=f"{POS_LABEL[p]}",
-            value=f"{mention(r['user_id'])}\n**{r['score']}**",
+            value=f"{mention(uid)}\n원점수 **{raw}**\n계산점 **{hp:+.1f}**",
             inline=True
         )
-    ranked = sorted(rows, key=lambda r: rank_key(r["score"], r["position"]))
-    ranks = "\n".join(
-        f"{i}. {POS_LABEL[r['position']]} {mention(r['user_id'])} **{r['score']}**"
-        for i, r in enumerate(ranked, 1)
-    )
-    embed.add_field(name="순위", value=ranks or "-", inline=False)
-    embed.set_footer(text=f"합계 {total} • game_id {game_id}")
+
+    # 원점수 기준 순위표
+    rank_lines = [
+        f"{i}. {POS_LABEL[r['position']]} {mention(int(r['user_id']))} **{int(r['score'])}**"
+        for i, r in enumerate(sorted_rows, 1)
+    ]
+    embed.add_field(name="원점수 순위(동점 ESWN)", value="\n".join(rank_lines) or "-", inline=False)
+    embed.set_footer(text=f"합계 {total_raw} • game_id {game_id}")
     return embed
 
 # ── View ──────────────────────────────────────────────────────────────────────
@@ -136,7 +170,7 @@ class ScoreModal(Modal):
             3: ordered_members[3],
         }
         self.pool = pool
-        for p in LABEL_ORDER_FOR_INPUT:
+        for p in [0, 1, 2, 3]:
             m = self.members_by_pos[p]
             self.add_item(TextInput(
                 label=f"{POS_LABEL[p]} {m.display_name} 점수",
@@ -148,10 +182,10 @@ class ScoreModal(Modal):
             ))
 
     async def on_submit(self, interaction: discord.Interaction):
-        scores: Dict[int, int] = {}
+        scores_by_pos: Dict[int, int] = {}
         total = 0
-        for p in LABEL_ORDER_FOR_INPUT:
-            raw = self.children[LABEL_ORDER_FOR_INPUT.index(p)].value
+        for p in [0, 1, 2, 3]:
+            raw = self.children[p].value
             try:
                 v = int(raw)
             except ValueError:
@@ -159,7 +193,7 @@ class ScoreModal(Modal):
                     f"{POS_LABEL[p]} {self.members_by_pos[p].display_name}: 정수만 입력", ephemeral=True
                 )
                 return
-            scores[p] = v
+            scores_by_pos[p] = v
             total += v
 
         if total != TARGET_TOTAL:
@@ -178,7 +212,7 @@ class ScoreModal(Modal):
                     inserts = []
                     for p in [0, 1, 2, 3]:
                         uid = int(self.members_by_pos[p].id)
-                        inserts.append((game_id, uid, scores[p], p))
+                        inserts.append((game_id, uid, scores_by_pos[p], p))
                     await cur.executemany(
                         "INSERT INTO game_detail (game_id, user_id, score, position) VALUES (%s,%s,%s,%s)",
                         inserts
@@ -192,10 +226,10 @@ class ScoreModal(Modal):
 
         await interaction.response.send_message(f"저장 완료. game_id={game_id}", ephemeral=True)
 
-        # 공개 메시지 + 관리 버튼(모두 볼 수 있음)
-        rows = [{"user_id": int(self.members_by_pos[p].id), "score": scores[p], "position": p} for p in [0,1,2,3]]
+        # 공개 메시지 + 관리 버튼
+        rows = [{"user_id": int(self.members_by_pos[p].id), "score": scores_by_pos[p], "position": p} for p in [0,1,2,3]]
         embed = build_game_embed(game_id, rows, title_prefix="게임 결과")
-        msg = await interaction.followup.send(embed=embed, wait=True)  # 공개 메시지. :contentReference[oaicite:1]{index=1}
+        msg = await interaction.followup.send(embed=embed, wait=True)  # 공개
         await msg.edit(view=ManageGameView(game_id, msg.id, msg.channel.id))
 
 class EditScoreModal(Modal):
@@ -260,14 +294,13 @@ class EditScoreModal(Modal):
             await interaction.response.send_message(f"DB 오류: {e}", ephemeral=True)
             return
 
-        # 공개 메시지 편집(모두 볼 수 있음)
+        # 공개 메시지 편집
         try:
             channel = interaction.client.get_channel(self.channel_id) or await interaction.client.fetch_channel(self.channel_id)  # type: ignore
             msg = await channel.fetch_message(self.message_id)  # type: ignore
             rows = await fetch_game(self.pool, self.game_id)
             new_embed = build_game_embed(self.game_id, rows, title_prefix="게임 수정 결과")
-            await msg.edit(embed=new_embed, view=ManageGameView(self.game_id, self.message_id, self.channel_id))  # :contentReference[oaicite:2]{index=2}
-            # 공개 알림(간결)
+            await msg.edit(embed=new_embed, view=ManageGameView(self.game_id, self.message_id, self.channel_id))
             await interaction.response.send_message("수정 완료", ephemeral=True)
             await interaction.followup.send(f"🛠️ 게임 #{self.game_id} 점수 수정됨.", ephemeral=False)
         except Exception as e:
@@ -275,7 +308,7 @@ class EditScoreModal(Modal):
 
 # ── 선택 뷰 ────────────────────────────────────────────────────────────────────
 class PagedPlayerSelectView(View):
-    """역할 보유 사용자 목록 페이지네이션. 정확히 4명 선택."""
+    """역할 보유 사용자 목록을 페이지로 나눠 Select 제공. 정확히 4명 선택."""
     def __init__(self, members: List[discord.Member], pool: aiomysql.Pool, per_page: int = PAGE_SIZE):
         super().__init__(timeout=120)
         self.members = members
@@ -340,6 +373,56 @@ class PagedPlayerSelectView(View):
         next_btn.callback = on_next
         self.add_item(prev_btn); self.add_item(next_btn)
 
+# ── 랭킹 계산 ──────────────────────────────────────────────────────────────────
+def iter_groupby_game(rows: Iterable[Tuple[int, int, int, int]]) -> Iterable[Tuple[int, List[Tuple[int,int,int,int]]]]:
+    """game_id 기준으로 묶기."""
+    cur_gid = None
+    bucket: List[Tuple[int,int,int,int]] = []
+    for gid, uid, sc, pos in rows:
+        if cur_gid is None:
+            cur_gid = gid
+        if gid != cur_gid:
+            yield cur_gid, bucket
+            bucket = []
+            cur_gid = gid
+        bucket.append((gid, uid, sc, pos))
+    if cur_gid is not None and bucket:
+        yield cur_gid, bucket
+
+def assign_ranks_for_game(game_rows: List[Tuple[int,int,int,int]]) -> Dict[int, int]:
+    """해당 게임의 user_id -> rank(1~4). 원점수 내림차순, 동점 ESWN."""
+    # 튜플: (uid, score, pos)
+    triples = [(uid, sc, pos) for (_, uid, sc, pos) in game_rows]
+    triples.sort(key=lambda t: rank_sort_key(t[1], t[2]))
+    return {uid: i+1 for i, (uid, _, _) in enumerate(triples)}
+
+async def compute_aggregate_points(pool: aiomysql.Pool) -> List[Tuple[int, float, int]]:
+    """
+    사용자별 총 계산점 합계와 판수.
+    return: [(user_id, total_points, games), ...]
+    """
+    rows = await fetch_all_details(pool)
+    if not rows:
+        return []
+    totals: Dict[int, float] = defaultdict(float)
+    counts: Dict[int, int] = defaultdict(int)
+
+    for gid, bucket in iter_groupby_game(rows):
+        if len(bucket) != 4:
+            # 불완전 게임은 스킵
+            continue
+        ranks = assign_ranks_for_game(bucket)
+        for _, uid, sc, _ in bucket:
+            rk = ranks[uid]
+            hp = calc_hanchan_points(sc, rk)
+            totals[uid] += hp
+            counts[uid] += 1
+
+    result = [(uid, totals[uid], counts[uid]) for uid in totals.keys()]
+    # 정렬: 평균 내림차순, 총점 내림차순, user_id 오름차순
+    result.sort(key=lambda t: (-(t[1] / t[2] if t[2] else -1e9), -t[1], t[0]))
+    return result
+
 # ── BOT ────────────────────────────────────────────────────────────────────────
 mahjong_group = app_commands.Group(name="마장", description="마장 명령 모음")
 
@@ -392,7 +475,7 @@ async def cmd_score_input(interaction: discord.Interaction):
     view = PagedPlayerSelectView(members, pool=bot.db_pool, per_page=PAGE_SIZE)
     await interaction.response.send_message("현재 페이지에서 정확히 4명을 선택하세요.", view=view, ephemeral=True)
 
-@mahjong_group.command(name="순위조회", description="누적 평균 점수(총점/판수) 기준 상위 사용자")
+@mahjong_group.command(name="순위조회", description="계산점 기준 상위 사용자(평균=총점/판수)")
 @app_commands.describe(limit="상위 N명 (기본 10)")
 async def cmd_rank(interaction: discord.Interaction, limit: int = 10):
     if interaction.channel_id != CHANNEL_ID:
@@ -402,42 +485,28 @@ async def cmd_rank(interaction: discord.Interaction, limit: int = 10):
     if pool is None:
         await interaction.response.send_message("DB 연결 초기화 실패", ephemeral=True)
         return
-    async with pool.acquire() as conn, conn.cursor() as cur:
-        await cur.execute(
-            """
-            SELECT user_id,
-                   SUM(score)   AS total,
-                   COUNT(*)     AS games,
-                   AVG(score)   AS avg_score
-            FROM game_detail
-            GROUP BY user_id
-            HAVING games > 0
-            ORDER BY avg_score DESC, total DESC, user_id ASC
-            LIMIT %s
-            """,
-            (int(limit),),
-        )
-        rows = await cur.fetchall()
 
-    if not rows:
+    agg = await compute_aggregate_points(pool)
+    if not agg:
         await interaction.response.send_message("데이터가 없습니다.", ephemeral=True)
         return
 
+    rows = agg[:max(1, int(limit))]
     embed = discord.Embed(
-        title="마장 순위조회 — 평균 점수(총점/판수)",
+        title="마장 순위조회 — 계산점 평균(총점/판수)",
         colour=discord.Colour.gold(),
         timestamp=datetime.now(timezone.utc),
     )
-    for i, (uid, total, games, avg_score) in enumerate(rows, 1):
-        uid = int(uid); total = int(total); games = int(games)
-        avg_val = float(avg_score) if avg_score is not None else 0.0
+    for i, (uid, total, games) in enumerate(rows, 1):
+        avg_val = total / games if games else 0.0
         embed.add_field(
             name=f"{i}.",
-            value=f"{mention(uid)}\n총점 {total} / 판수 {games} = **{avg_val:.2f}**",
+            value=f"{mention(uid)}\n총점 **{total:+.1f}** / 판수 {games} = 평균 **{avg_val:+.2f}**",
             inline=False
         )
+    embed.set_footer(text="계산식: ((종료-25,000)/1,000)+우마 • 우마 15/5/-5/-15")
     # 호출자에게만 표시
-    await interaction.response.send_message(embed=embed, ephemeral=True)  # :contentReference[oaicite:3]{index=3}
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # ── 버튼 처리: 재시작 후에도 동작 ──────────────────────────────────────────────
 @bot.event
@@ -487,7 +556,7 @@ async def on_interaction(interaction: discord.Interaction):
         except Exception as e:
             await interaction.response.send_message(f"삭제 실패: {e}", ephemeral=True)
             return
-        # 공개 알림(모두 보이게)
+        # 공개 알림
         try:
             channel = interaction.client.get_channel(int(ch)) or await interaction.client.fetch_channel(int(ch))  # type: ignore
             msg = await channel.fetch_message(int(mid))  # type: ignore
@@ -495,7 +564,7 @@ async def on_interaction(interaction: discord.Interaction):
         except Exception:
             pass
         await interaction.response.send_message("삭제 완료", ephemeral=True)
-        await interaction.followup.send(f"🗑️ 게임 #{gid} 기록이 삭제되었습니다.", ephemeral=False)  # :contentReference[oaicite:4]{index=4}
+        await interaction.followup.send(f"🗑️ 게임 #{gid} 기록이 삭제되었습니다.", ephemeral=False)
         return
 
     if prefix == "mm_del_cancel":
