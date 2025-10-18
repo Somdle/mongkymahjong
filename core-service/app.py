@@ -2,8 +2,10 @@
 
 import os
 from typing import List, Tuple, Dict, Any
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 
-import aiomysql  # pip install aiomysql
+import aiomysql  # pip install aiomysql python-dotenv discord.py
 import discord
 from discord import app_commands
 from discord.ui import View, Select, Modal, TextInput, Button
@@ -25,45 +27,18 @@ DB_NAME = os.getenv("DB_NAME", "monkeymahjong")
 if not BOT_TOKEN or CHANNEL_ID == 0:
     raise RuntimeError("DISCORD_BOT_TOKEN / DISCORD_CHANNEL_ID 필요")
 
-# 좌석 라벨 및 포지션 인덱스
+# 좌석 및 타이브레이크
 POS_LABEL = {0: "동", 1: "서", 2: "남", 3: "북"}
-LABEL_ORDER_FOR_INPUT = [0, 1, 2, 3]  # 입력 라벨 순서: 동, 서, 남, 북
-TIEBREAK_ESWN = {0: 0, 2: 1, 1: 2, 3: 3}  # 동(0)→남(2)→서(1)→북(3)
-
-# ── 공용 유틸 ──────────────────────────────────────────────────────────────────
-def mention(uid: int) -> str:
-    return f"<@{uid}>"
+LABEL_ORDER_FOR_INPUT = [0, 1, 2, 3]
+TIEBREAK_ESWN = {0: 0, 2: 1, 1: 2, 3: 3}
 
 def rank_key(score: int, pos: int) -> Tuple[int, int]:
     return (-score, TIEBREAK_ESWN[pos])
 
-def fmt_game_result(game_id: int, rows: List[Dict[str, Any]], guild: discord.Guild) -> str:
-    """
-    rows: [{user_id:int, score:int, position:int}]
-    """
-    # 좌석순 표기
-    seat_lines = []
-    total = 0
-    by_pos = {r["position"]: r for r in rows}
-    for p in [0, 1, 2, 3]:
-        r = by_pos.get(p)
-        if not r:
-            continue
-        total += r["score"]
-        seat_lines.append(f"{POS_LABEL[p]} {mention(r['user_id'])} {r['score']}")
-    # 순위 계산(점수 desc, 타이브레이크 ESWN)
-    ranked = sorted(rows, key=lambda r: rank_key(r["score"], r["position"]))
-    rank_lines = []
-    for i, r in enumerate(ranked, 1):
-        rank_lines.append(f"{i}. {POS_LABEL[r['position']]} {mention(r['user_id'])} {r['score']}")
-    return (
-        f"[게임 #{game_id}] 결과\n"
-        + "\n".join(seat_lines)
-        + f"\n합계: {total}\n"
-        + "순위(동점 ESWN):\n"
-        + "\n".join(rank_lines)
-    )
+def mention(uid: int) -> str:
+    return f"<@{uid}>"
 
+# ── DB 유틸 ───────────────────────────────────────────────────────────────────
 async def fetch_game(pool: aiomysql.Pool, game_id: int) -> List[Dict[str, Any]]:
     async with pool.acquire() as conn, conn.cursor() as cur:
         await cur.execute(
@@ -73,14 +48,86 @@ async def fetch_game(pool: aiomysql.Pool, game_id: int) -> List[Dict[str, Any]]:
         rows = await cur.fetchall()
     return [{"user_id": int(r[0]), "score": int(r[1]), "position": int(r[2])} for r in rows]
 
+async def delete_game(pool: aiomysql.Pool, game_id: int) -> int:
+    async with pool.acquire() as conn:
+        await conn.begin()
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute("DELETE FROM game_detail WHERE game_id=%s", (game_id,))
+                await cur.execute("DELETE FROM game WHERE id=%s", (game_id,))
+                affected = cur.rowcount
+            await conn.commit()
+        except Exception:
+            await conn.rollback()
+            raise
+    return affected
+
+async def fetch_games_between(pool: aiomysql.Pool, start_dt: datetime, end_dt: datetime, limit: int = 5) -> Dict[int, List[Dict[str, Any]]]:
+    async with pool.acquire() as conn, conn.cursor() as cur:
+        await cur.execute(
+            """
+            SELECT g.id, g.date, gd.user_id, gd.score, gd.position
+            FROM game g
+            JOIN game_detail gd ON gd.game_id = g.id
+            WHERE g.date >= %s AND g.date < %s
+            ORDER BY g.id ASC, gd.position ASC
+            """,
+            (start_dt, end_dt)
+        )
+        rows = await cur.fetchall()
+    grouped: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    order: List[int] = []
+    for gid, gdate, uid, score, pos in rows:
+        gid = int(gid)
+        if gid not in grouped:
+            order.append(gid)
+        grouped[gid].append({
+            "user_id": int(uid),
+            "score": int(score),
+            "position": int(pos),
+            "date": gdate,
+        })
+    limited: Dict[int, List[Dict[str, Any]]] = {}
+    for gid in order[:limit]:
+        limited[gid] = grouped[gid]
+    return limited
+
+# ── 임베드 ────────────────────────────────────────────────────────────────────
+def build_game_embed(game_id: int, rows: List[Dict[str, Any]], *, title_prefix: str = "게임 결과") -> discord.Embed:
+    embed = discord.Embed(
+        title=f"{title_prefix} #{game_id}",
+        description="동점 시 ESWN(동→남→서→북) 순",
+        colour=discord.Colour.blue(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    total = 0
+    by_pos = {r["position"]: r for r in rows}
+    for p in [0, 1, 2, 3]:
+        r = by_pos.get(p)
+        if not r:
+            continue
+        total += r["score"]
+        embed.add_field(
+            name=f"{POS_LABEL[p]} {mention(r['user_id'])}",
+            value=f"**{r['score']}**",
+            inline=True
+        )
+    ranked = sorted(rows, key=lambda r: rank_key(r["score"], r["position"]))
+    ranks = "\n".join(
+        f"{i}. {POS_LABEL[r['position']]} {mention(r['user_id'])} **{r['score']}**"
+        for i, r in enumerate(ranked, 1)
+    )
+    embed.add_field(name="순위", value=ranks or "-", inline=False)
+    embed.set_footer(text=f"합계 {total} • /점수조회_게임 {game_id}")
+    return embed
+
 # ── UI ─────────────────────────────────────────────────────────────────────────
 class ScoreModal(Modal):
-    """새 게임 입력. 선택된 4명에 대해 '동/서/남/북 <닉네임> 점수' 입력."""
+    """새 게임 입력 + 저장 + 공개 임베드."""
     def __init__(self, ordered_members: List[discord.Member], pool: aiomysql.Pool):
         super().__init__(title="점수 입력")
         if len(ordered_members) != 4:
             raise ValueError("ScoreModal requires exactly 4 members")
-        # 선택 순서 → position 매핑: 0:동,1:서,2:남,3:북
         self.members_by_pos: Dict[int, discord.Member] = {
             0: ordered_members[0],
             1: ordered_members[1],
@@ -100,7 +147,6 @@ class ScoreModal(Modal):
             ))
 
     async def on_submit(self, interaction: discord.Interaction):
-        # 정수 변환 + 합계 = 10000 확인
         scores: Dict[int, int] = {}
         total = 0
         for p in LABEL_ORDER_FOR_INPUT:
@@ -123,7 +169,7 @@ class ScoreModal(Modal):
             )
             return
 
-        # DB 트랜잭션 저장
+        # DB 저장
         try:
             async with self.pool.acquire() as conn:
                 await conn.begin()
@@ -147,22 +193,20 @@ class ScoreModal(Modal):
             await interaction.response.send_message(f"DB 오류: {e}", ephemeral=True)
             return
 
-        # 개인 응답 + 채널 공개 결과
+        # 개인 확인 후 공개 임베드 + 관리 버튼
         await interaction.response.send_message(f"저장 완료. game_id={game_id}", ephemeral=True)
-        rows = [{"user_id": int(m.id), "score": scores[p], "position": p} for p, m in self.members_by_pos.items()]
-        await interaction.followup.send(fmt_game_result(game_id, rows, interaction.guild))
+        rows = [{"user_id": int(self.members_by_pos[p].id), "score": scores[p], "position": p} for p in [0,1,2,3]]
+        embed = build_game_embed(game_id, rows, title_prefix="게임 결과")
+        await interaction.followup.send(embed=embed, view=ManageGameView(game_id, self.pool))
 
 class ReenterView(View):
-    """합계 오류 시 재입력"""
     def __init__(self, members_in_order: List[discord.Member], pool: aiomysql.Pool):
         super().__init__(timeout=120)
         self.members = members_in_order
         self.pool = pool
         btn = Button(label="다시 입력", style=discord.ButtonStyle.primary)
-
         async def on_click(itx: discord.Interaction):
             await itx.response.send_modal(ScoreModal(self.members, self.pool))
-
         btn.callback = on_click
         self.add_item(btn)
 
@@ -172,7 +216,6 @@ class EditScoreModal(Modal):
         super().__init__(title=f"게임 #{game_id} 점수 수정")
         self.game_id = game_id
         self.pool = pool
-        # position 기준 정렬(동,서,남,북)
         self.rows = sorted(rows, key=lambda r: r["position"])
         self.members_by_pos: Dict[int, Tuple[int, str]] = {}
         for r in self.rows:
@@ -189,7 +232,7 @@ class EditScoreModal(Modal):
                 required=True,
                 max_length=10,
                 custom_id=f"edit_{p}",
-                default=str(r["score"]),  # 프리필 :contentReference[oaicite:2]{index=2}
+                default=str(r["score"]),
             ))
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -232,31 +275,151 @@ class EditScoreModal(Modal):
             await interaction.response.send_message(f"DB 오류: {e}", ephemeral=True)
             return
 
-        # 공개 결과 재게시
         rows = [{"user_id": self.members_by_pos[p][0], "score": new_scores[p], "position": p} for p in [0,1,2,3]]
+        embed = build_game_embed(self.game_id, rows, title_prefix="게임 수정 결과")
         await interaction.response.send_message(f"게임 #{self.game_id} 수정 완료", ephemeral=True)
-        await interaction.followup.send(fmt_game_result(self.game_id, rows, interaction.guild))
+        await interaction.followup.send(embed=embed)
 
 class ReenterEditView(View):
-    """수정 합계 오류 시 재입력"""
     def __init__(self, game_id: int, rows: List[Dict[str, Any]], guild: discord.Guild, pool: aiomysql.Pool):
         super().__init__(timeout=120)
         self.game_id, self.rows, self.guild, self.pool = game_id, rows, guild, pool
         btn = Button(label="다시 입력", style=discord.ButtonStyle.primary)
-
         async def on_click(itx: discord.Interaction):
             await itx.response.send_modal(EditScoreModal(self.game_id, self.rows, self.guild, self.pool))
-
         btn.callback = on_click
         self.add_item(btn)
 
+class ConfirmDeleteView(View):
+    def __init__(self, game_id: int, pool: aiomysql.Pool):
+        super().__init__(timeout=60)
+        self.game_id = game_id
+        self.pool = pool
+        ok_btn = Button(label="삭제 확인", style=discord.ButtonStyle.danger)
+        cancel_btn = Button(label="취소", style=discord.ButtonStyle.secondary)
+
+        async def on_ok(itx: discord.Interaction):
+            if itx.channel_id != CHANNEL_ID:
+                await itx.response.send_message("지정 채널에서만 가능", ephemeral=True)
+                return
+            try:
+                await delete_game(self.pool, self.game_id)
+            except Exception as e:
+                await itx.response.send_message(f"삭제 실패: {e}", ephemeral=True)
+                return
+            await itx.response.send_message(f"게임 #{self.game_id} 삭제됨", ephemeral=True)
+            await itx.followup.send(f"🗑️ 게임 #{self.game_id} 기록이 삭제되었습니다.")
+
+        async def on_cancel(itx: discord.Interaction):
+            await itx.response.send_message("삭제 취소", ephemeral=True)
+
+        ok_btn.callback = on_ok
+        cancel_btn.callback = on_cancel
+        self.add_item(ok_btn); self.add_item(cancel_btn)
+
+class ManageGameView(View):
+    """결과 메시지 아래 관리 버튼. 콜백으로 직접 처리."""
+    def __init__(self, game_id: int, pool: aiomysql.Pool):
+        super().__init__(timeout=300)
+        self.game_id = game_id
+        self.pool = pool
+
+        btn_view = Button(label="게임 조회", style=discord.ButtonStyle.secondary)
+        btn_edit = Button(label="게임 수정", style=discord.ButtonStyle.primary)
+        btn_del  = Button(label="게임 삭제", style=discord.ButtonStyle.danger)
+
+        async def on_view(itx: discord.Interaction):
+            if itx.channel_id != CHANNEL_ID:
+                await itx.response.send_message("지정 채널에서만 가능", ephemeral=True)
+                return
+            rows = await fetch_game(self.pool, self.game_id)
+            if len(rows) != 4:
+                await itx.response.send_message("게임 데이터를 찾을 수 없습니다.", ephemeral=True)
+                return
+            await itx.response.send_message(embed=build_game_embed(self.game_id, rows, title_prefix="게임 조회"), ephemeral=True)
+
+        async def on_edit(itx: discord.Interaction):
+            if itx.channel_id != CHANNEL_ID:
+                await itx.response.send_message("지정 채널에서만 가능", ephemeral=True)
+                return
+            rows = await fetch_game(self.pool, self.game_id)
+            if len(rows) != 4:
+                await itx.response.send_message("게임 데이터를 찾을 수 없습니다.", ephemeral=True)
+                return
+            await itx.response.send_modal(EditScoreModal(self.game_id, rows, itx.guild, self.pool))
+
+        async def on_del(itx: discord.Interaction):
+            if itx.channel_id != CHANNEL_ID:
+                await itx.response.send_message("지정 채널에서만 가능", ephemeral=True)
+                return
+            await itx.response.send_message(
+                f"게임 #{self.game_id} 삭제 확인이 필요합니다.",
+                view=ConfirmDeleteView(self.game_id, self.pool),
+                ephemeral=True
+            )
+
+        btn_view.callback = on_view
+        btn_edit.callback = on_edit
+        btn_del.callback  = on_del
+
+        self.add_item(btn_view); self.add_item(btn_edit); self.add_item(btn_del)
+
+# ── BOT ────────────────────────────────────────────────────────────────────────
+class MyBot(discord.Client):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.members = True
+        super().__init__(intents=intents)
+        self.tree = app_commands.CommandTree(self)
+        self.db_pool: aiomysql.Pool | None = None
+
+    async def setup_hook(self):
+        self.db_pool = await aiomysql.create_pool(
+            host=DB_HOST, port=DB_PORT,
+            user=DB_USER, password=DB_PASSWORD, db=DB_NAME,
+            autocommit=False, minsize=1, maxsize=5,
+        )
+        await self.tree.sync()
+
+    async def close(self):
+        if self.db_pool is not None:
+            self.db_pool.close()
+            await self.db_pool.wait_closed()
+        await super().close()
+
+bot = MyBot()
+
+# ── 명령들 ─────────────────────────────────────────────────────────────────────
+@bot.tree.command(name="점수입력", description=f"{ROLE_NAME} 역할 대상 4명 선택 후 점수 입력")
+async def 점수입력(interaction: discord.Interaction):
+    if interaction.channel_id != CHANNEL_ID:
+        await interaction.response.send_message("지정 채널에서만 사용 가능합니다.", ephemeral=True)
+        return
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message("길드에서만 사용 가능합니다.", ephemeral=True)
+        return
+    if bot.db_pool is None:
+        await interaction.response.send_message("DB 연결 초기화 실패", ephemeral=True)
+        return
+    role = discord.utils.get(guild.roles, name=ROLE_NAME)
+    if role is None:
+        await interaction.response.send_message(f"역할 '{ROLE_NAME}' 없음", ephemeral=True)
+        return
+    members = [m for m in guild.members if (role in m.roles and not m.bot)]
+    if len(members) < 4:
+        await interaction.response.send_message("인원 부족: 최소 4명 필요", ephemeral=True)
+        return
+    view = PagedPlayerSelectView(members, pool=bot.db_pool, per_page=PAGE_SIZE)
+    await interaction.response.send_message("현재 페이지에서 정확히 4명을 선택하세요.", view=view, ephemeral=True)
+
 class PagedPlayerSelectView(View):
-    """역할 보유 사용자 목록을 페이지로 나눠 Select 제공. 현재 페이지에서 정확히 4명."""
+    """역할 보유 사용자 목록을 페이지로 나눠 Select 제공. 정확히 4명 선택."""
     def __init__(self, members: List[discord.Member], pool: aiomysql.Pool, per_page: int = PAGE_SIZE):
         super().__init__(timeout=120)
         self.members = members
         self.pool = pool
-        self.per_page = max(4, min(25, per_page))
+        self.per_page = max(4, min(25, per_page))  # Select 옵션은 최대 25개/페이지. :contentReference[oaicite:1]{index=1}
         self.page = 0
         self._rebuild()
 
@@ -316,56 +479,6 @@ class PagedPlayerSelectView(View):
         next_btn.callback = on_next
         self.add_item(prev_btn); self.add_item(next_btn)
 
-# ── BOT ────────────────────────────────────────────────────────────────────────
-class MyBot(discord.Client):
-    def __init__(self):
-        intents = discord.Intents.default()
-        intents.members = True
-        super().__init__(intents=intents)
-        self.tree = app_commands.CommandTree(self)
-        self.db_pool: aiomysql.Pool | None = None
-
-    async def setup_hook(self):
-        self.db_pool = await aiomysql.create_pool(
-            host=DB_HOST, port=DB_PORT,
-            user=DB_USER, password=DB_PASSWORD, db=DB_NAME,
-            autocommit=False, minsize=1, maxsize=5,
-        )
-        await self.tree.sync()
-
-    async def close(self):
-        if self.db_pool is not None:
-            self.db_pool.close()
-            await self.db_pool.wait_closed()
-        await super().close()
-
-bot = MyBot()
-
-# ── 명령: 점수입력 ─────────────────────────────────────────────────────────────
-@bot.tree.command(name="점수입력", description=f"{ROLE_NAME} 역할 대상 4명 선택 후 점수 입력")
-async def 점수입력(interaction: discord.Interaction):
-    if interaction.channel_id != CHANNEL_ID:
-        await interaction.response.send_message("지정 채널에서만 사용 가능합니다.", ephemeral=True)
-        return
-    guild = interaction.guild
-    if guild is None:
-        await interaction.response.send_message("길드에서만 사용 가능합니다.", ephemeral=True)
-        return
-    if bot.db_pool is None:
-        await interaction.response.send_message("DB 연결 초기화 실패", ephemeral=True)
-        return
-    role = discord.utils.get(guild.roles, name=ROLE_NAME)
-    if role is None:
-        await interaction.response.send_message(f"역할 '{ROLE_NAME}' 없음", ephemeral=True)
-        return
-    members = [m for m in guild.members if (role in m.roles and not m.bot)]
-    if len(members) < 4:
-        await interaction.response.send_message("인원 부족: 최소 4명 필요", ephemeral=True)
-        return
-    view = PagedPlayerSelectView(members, pool=bot.db_pool, per_page=PAGE_SIZE)
-    await interaction.response.send_message("현재 페이지에서 정확히 4명을 선택하세요.", view=view, ephemeral=True)
-
-# ── 명령: 점수조회_게임 ─────────────────────────────────────────────────────────
 @bot.tree.command(name="점수조회_게임", description="game_id로 해당 게임 점수 조회")
 @app_commands.describe(game_id="조회할 게임 ID")
 async def 점수조회_게임(interaction: discord.Interaction, game_id: int):
@@ -379,9 +492,8 @@ async def 점수조회_게임(interaction: discord.Interaction, game_id: int):
     if len(rows) != 4:
         await interaction.response.send_message("게임을 찾을 수 없거나 데이터가 불완전합니다.", ephemeral=True)
         return
-    await interaction.response.send_message(fmt_game_result(game_id, rows, interaction.guild))
+    await interaction.response.send_message(embed=build_game_embed(game_id, rows, title_prefix="게임 조회"))
 
-# ── 명령: 점수조회_사용자 ───────────────────────────────────────────────────────
 @bot.tree.command(name="점수조회_사용자", description="특정 사용자가 참여한 게임 목록")
 @app_commands.describe(user="사용자", limit="최근 N건 (기본 10)")
 async def 점수조회_사용자(interaction: discord.Interaction, user: discord.User, limit: int = 10):
@@ -414,7 +526,6 @@ async def 점수조회_사용자(interaction: discord.Interaction, user: discord
         f"{mention(int(user.id))} 최근 {len(rows)}건\n" + "\n".join(lines)
     )
 
-# ── 명령: 점수조회_랭킹 ─────────────────────────────────────────────────────────
 @bot.tree.command(name="점수조회_랭킹", description="누적 점수 상위 사용자")
 @app_commands.describe(limit="상위 N명 (기본 10)")
 async def 점수조회_랭킹(interaction: discord.Interaction, limit: int = 10):
@@ -439,12 +550,41 @@ async def 점수조회_랭킹(interaction: discord.Interaction, limit: int = 10)
     if not rows:
         await interaction.response.send_message("데이터가 없습니다.", ephemeral=True)
         return
-    lines = []
+    embed = discord.Embed(
+        title="누적 랭킹",
+        colour=discord.Colour.gold(),
+        timestamp=datetime.now(timezone.utc),
+    )
     for i, (uid, total, games) in enumerate(rows, 1):
-        lines.append(f"{i}. {mention(int(uid))} 총 {int(total)} ({int(games)}판)")
-    await interaction.response.send_message("누적 랭킹\n" + "\n".join(lines))
+        embed.add_field(name=f"{i}. {mention(int(uid))}", value=f"총 {int(total)}점 • {int(games)}판", inline=False)
+    embed.set_footer(text=f"상위 {len(rows)}명")
+    await interaction.response.send_message(embed=embed)
 
-# ── 명령: 게임수정 ─────────────────────────────────────────────────────────────
+@bot.tree.command(name="점수조회_기간", description="기간 내 게임 목록 조회")
+@app_commands.describe(start="YYYY-MM-DD", end="YYYY-MM-DD", limit="최대 몇 건(기본 5)")
+async def 점수조회_기간(interaction: discord.Interaction, start: str, end: str, limit: int = 5):
+    if interaction.channel_id != CHANNEL_ID:
+        await interaction.response.send_message("지정 채널에서만 사용 가능합니다.", ephemeral=True)
+        return
+    if bot.db_pool is None:
+        await interaction.response.send_message("DB 연결 초기화 실패", ephemeral=True)
+        return
+    try:
+        start_dt = datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        end_dt = datetime.strptime(end, "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=1)
+    except ValueError:
+        await interaction.response.send_message("날짜 형식 오류. 예: 2025-10-01", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    grouped = await fetch_games_between(bot.db_pool, start_dt, end_dt, limit=limit)
+    if not grouped:
+        await interaction.followup.send("해당 기간 기록이 없습니다.", ephemeral=True)
+        return
+    for gid, rows in grouped.items():
+        await interaction.followup.send(embed=build_game_embed(gid, rows, title_prefix="기간 조회"), ephemeral=False)
+    await interaction.followup.send(f"{len(grouped)}건 표시 완료.", ephemeral=True)
+
 @bot.tree.command(name="게임수정", description="game_id로 점수 수정")
 @app_commands.describe(game_id="수정할 게임 ID")
 async def 게임수정(interaction: discord.Interaction, game_id: int):
@@ -459,6 +599,25 @@ async def 게임수정(interaction: discord.Interaction, game_id: int):
         await interaction.response.send_message("게임을 찾을 수 없거나 데이터가 불완전합니다.", ephemeral=True)
         return
     await interaction.response.send_modal(EditScoreModal(game_id, rows, interaction.guild, bot.db_pool))
+
+@bot.tree.command(name="게임삭제", description="game_id로 게임 기록 삭제")
+@app_commands.describe(game_id="삭제할 게임 ID")
+async def 게임삭제(interaction: discord.Interaction, game_id: int):
+    if interaction.channel_id != CHANNEL_ID:
+        await interaction.response.send_message("지정 채널에서만 사용 가능합니다.", ephemeral=True)
+        return
+    if bot.db_pool is None:
+        await interaction.response.send_message("DB 연결 초기화 실패", ephemeral=True)
+        return
+    rows = await fetch_game(bot.db_pool, game_id)
+    if not rows:
+        await interaction.response.send_message("게임을 찾을 수 없습니다.", ephemeral=True)
+        return
+    await interaction.response.send_message(
+        f"게임 #{game_id} 삭제 확인이 필요합니다.",
+        view=ConfirmDeleteView(game_id, bot.db_pool),
+        ephemeral=True
+    )
 
 # ── ENTRY ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
