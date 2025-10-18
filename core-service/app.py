@@ -13,21 +13,25 @@ load_dotenv()
 BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 ROLE_NAME = os.getenv("DISCORD_ROLE_NAME", "게임")
 CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "0"))  # 이 채널에서만 작동
-PAGE_SIZE = int(os.getenv("DISCORD_SELECT_PAGE_SIZE", "25"))  # Select 옵션 최대 25개
+PAGE_SIZE = int(os.getenv("DISCORD_SELECT_PAGE_SIZE", "25"))  # Select 옵션 최대 25개/페이지
 
 if not BOT_TOKEN or CHANNEL_ID == 0:
     raise RuntimeError("DISCORD_BOT_TOKEN / DISCORD_CHANNEL_ID 환경변수 필요")
 
+DIRECTIONS = ["동", "서", "남", "북"]  # 선택 순서 매핑
+
 # ── UI ─────────────────────────────────────────────────────────────────────────
 class ScoreModal(Modal):
-    """선택된 멤버별 정수 점수 입력 모달. 정확히 4명 전제."""
-    def __init__(self, members: List[discord.Member]):
+    """선택된 4명에 대해 '동/서/남/북 <닉네임> 점수' 입력 모달."""
+    def __init__(self, ordered_members: List[discord.Member]):
         super().__init__(title="점수 입력")
-        # 정확히 4명만 허용
-        self.members = members[:4]
-        for m in self.members:
+        if len(ordered_members) != 4:
+            raise ValueError("ScoreModal requires exactly 4 members")
+        self.members = ordered_members
+        # 방향 라벨 부여: 선택 순서대로 동, 서, 남, 북
+        for dir_name, m in zip(DIRECTIONS, self.members):
             self.add_item(TextInput(
-                label=f"{m.display_name} 점수",
+                label=f"{dir_name} {m.display_name} 점수",
                 style=discord.TextStyle.short,
                 placeholder="정수 입력",
                 required=True,
@@ -35,34 +39,57 @@ class ScoreModal(Modal):
             ))
 
     async def on_submit(self, interaction: discord.Interaction):
+        # 정수 변환 및 합계 검증
         scores: dict[int, int] = {}
+        total = 0
         for i, m in enumerate(self.members):
             raw = self.children[i].value
             try:
-                scores[m.id] = int(raw)
+                val = int(raw)
             except ValueError:
                 await interaction.response.send_message(
-                    f"{m.display_name} 점수는 정수여야 합니다: '{raw}'",
-                    ephemeral=True
+                    f"{DIRECTIONS[i]} {m.display_name}: 정수만 입력하세요.", ephemeral=True
                 )
                 return
-        # TODO: 저장 로직 삽입
-        await interaction.response.send_message(f"점수 저장됨: {scores}", ephemeral=True)
+            scores[m.id] = val
+            total += val
+
+        if total != 10000:
+            # 재입력 요구: 모달 내에서 바로 재오픈 불가 → 버튼을 통해 새 인터랙션으로 모달 재호출
+            await interaction.response.send_message(
+                f"총합이 {total}점입니다. 10000점이 되어야 합니다. 다시 입력하세요.",
+                view=ReenterView(self.members),
+                ephemeral=True
+            )
+            return
+
+        # TODO: 저장 로직 삽입 (예: await save_scores(interaction.guild.id, scores))
+        await interaction.response.send_message(f"점수 저장됨: 합계 {total}", ephemeral=True)
+
+
+class ReenterView(View):
+    """합계 불일치 시 재입력 버튼 제공."""
+    def __init__(self, members: List[discord.Member]):
+        super().__init__(timeout=120)
+        self.members = members
+        re_btn = Button(label="다시 입력", style=discord.ButtonStyle.primary)
+
+        async def on_reenter(interaction: discord.Interaction):
+            await interaction.response.send_modal(ScoreModal(self.members))
+
+        re_btn.callback = on_reenter
+        self.add_item(re_btn)
 
 
 class PagedPlayerSelectView(View):
     """
     역할 보유 사용자 목록을 페이지로 나눠 Select 제공.
-    - Discord 제한: Select options 최대 25개. (페이지당)  :contentReference[oaicite:3]{index=3}
-    - 정확히 4명 선택: min_values=4, max_values=4.         :contentReference[oaicite:4]{index=4}
-    - Prev/Next 버튼으로 페이지 전환.
-    - 선택은 "현재 페이지"에서만 4명.
+    - 선택은 현재 페이지에서 정확히 4명.
     """
     def __init__(self, members: List[discord.Member], per_page: int = PAGE_SIZE):
         super().__init__(timeout=120)
-        # 안전 가드
         self.members = members
-        self.per_page = max(4, min(25, per_page))  # 최소 4, 최대 25
+        self.per_page = max(4, min(25, per_page))  # 안전 가드
         self.page = 0
         self._rebuild()
 
@@ -79,11 +106,10 @@ class PagedPlayerSelectView(View):
         self.clear_items()
         page_members = self._slice()
 
-        # 현재 페이지 옵션이 4명 미만이면 선택 UI 제공 불가
+        # 현재 페이지 인원이 4명 미만이면 선택 UI 제공 불가
         if len(page_members) < 4:
-            btn = Button(label="이 페이지에 선택 가능한 인원이 4명 미만입니다.", disabled=True)
-            self.add_item(btn)
-            # 페이지 네비게이션은 제공
+            info_btn = Button(label="이 페이지 인원이 4명 미만입니다.", disabled=True)
+            self.add_item(info_btn)
             self._add_pager()
             return
 
@@ -101,24 +127,19 @@ class PagedPlayerSelectView(View):
         )
 
         async def on_select(interaction: discord.Interaction):
-            # 선택된 4명으로 모달 표시
+            # 선택값은 사용자 선택 순서대로 전달됨 → 동/서/남/북 매핑에 사용
             selected_ids = [int(v) for v in select.values]
-            selected = [interaction.guild.get_member(uid) for uid in selected_ids]
-            selected = [m for m in selected if m is not None]
-
-            # 방어: 정확히 4명인지 확인
-            if len(selected) != 4:
+            ordered = [interaction.guild.get_member(uid) for uid in selected_ids]
+            ordered = [m for m in ordered if m is not None]
+            if len(ordered) != 4:
                 await interaction.response.send_message(
                     "정확히 4명을 선택해야 합니다.", ephemeral=True
                 )
                 return
-
-            await interaction.response.send_modal(ScoreModal(selected))
+            await interaction.response.send_modal(ScoreModal(ordered))
 
         select.callback = on_select
         self.add_item(select)
-
-        # 페이지 네비게이션
         self._add_pager()
 
     def _add_pager(self):
@@ -146,7 +167,7 @@ class PagedPlayerSelectView(View):
 class MyBot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
-        intents.members = True  # 멤버 목록 접근. 포털에서 Privileged Intents 설정 필요할 수 있음. :contentReference[oaicite:5]{index=5}
+        intents.members = True  # 멤버 목록 접근 필요
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
 
@@ -172,7 +193,6 @@ async def 점수입력(interaction: discord.Interaction):
         await interaction.response.send_message(f"역할 '{ROLE_NAME}' 이(가) 없습니다.", ephemeral=True)
         return
 
-    # 역할 보유자 필터 (봇 제외)
     members = [m for m in guild.members if (role in m.roles and not m.bot)]
 
     # 전체 인원 자체가 4명 미만이면 즉시 인원 부족 알림
