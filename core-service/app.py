@@ -14,6 +14,7 @@ load_dotenv()  # 기본적으로 프로젝트 루트의 .env 파일을 읽는다
 # 환경변수 읽기
 BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 CHANNEL_ID = os.getenv("DISCORD_CHANNEL_ID")
+DISCORD_ROLE_NAME = os.getenv("DISCORD_ROLE_NAME")
 
 if BOT_TOKEN is None:
     raise RuntimeError("DISCORD_BOT_TOKEN 환경변수가 설정되지 않았습니다.")
@@ -87,12 +88,12 @@ class MyBot(discord.Client):
 
 bot = MyBot()
 
-@bot.tree.command(name="점수입력", description="게임 역할을 가진 사용자 선택 후 점수 입력")
+@bot.tree.command(name="점수입력", description=f"{DISCORD_ROLE_NAME} 역할을 가진 사용자 선택 후 점수 입력")
 async def 점수입력(interaction: discord.Interaction):
     guild = interaction.guild
-    game_role = discord.utils.get(guild.roles, name="게임")
+    game_role = discord.utils.get(guild.roles, name=DISCORD_ROLE_NAME)
     if not game_role:
-        await interaction.response.send_message("‘게임’ 역할이 존재하지 않습니다.", ephemeral=True)
+        await interaction.response.send_message(f"{DISCORD_ROLE_NAME} 역할이 존재하지 않습니다.", ephemeral=True)
         return
 
     members = [m for m in guild.members if (game_role in m.roles and not m.bot)]
