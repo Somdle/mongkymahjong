@@ -3,6 +3,7 @@
 import os
 from typing import List
 
+import aiomysql
 import discord
 from discord import app_commands
 from discord.ui import View, Select, Modal, TextInput, Button
@@ -12,23 +13,28 @@ from dotenv import load_dotenv
 load_dotenv()
 BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 ROLE_NAME = os.getenv("DISCORD_ROLE_NAME", "게임")
-CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "0"))  # 이 채널에서만 작동
-PAGE_SIZE = int(os.getenv("DISCORD_SELECT_PAGE_SIZE", "25"))  # Select 옵션 최대 25개/페이지
+CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "0"))           # 이 채널에서만 작동
+PAGE_SIZE = int(os.getenv("DISCORD_SELECT_PAGE_SIZE", "25"))     # Select 옵션 최대 25개/페이지
+DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
+DB_PORT = int(os.getenv("DB_PORT", "3306"))
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+DB_NAME = os.getenv("DB_NAME")
 
 if not BOT_TOKEN or CHANNEL_ID == 0:
     raise RuntimeError("DISCORD_BOT_TOKEN / DISCORD_CHANNEL_ID 환경변수 필요")
 
-DIRECTIONS = ["동", "서", "남", "북"]  # 선택 순서 매핑
+DIRECTIONS = ["동", "서", "남", "북"]  # 선택 순서 → 위치 0~3
 
 # ── UI ─────────────────────────────────────────────────────────────────────────
 class ScoreModal(Modal):
-    """선택된 4명에 대해 '동/서/남/북 <닉네임> 점수' 입력 모달."""
-    def __init__(self, ordered_members: List[discord.Member]):
+    """선택된 4명에 대해 '동/서/남/북 <닉네임> 점수' 입력 모달 + DB 저장."""
+    def __init__(self, ordered_members: List[discord.Member], pool: aiomysql.Pool):
         super().__init__(title="점수 입력")
         if len(ordered_members) != 4:
             raise ValueError("ScoreModal requires exactly 4 members")
         self.members = ordered_members
-        # 방향 라벨 부여: 선택 순서대로 동, 서, 남, 북
+        self.pool = pool
         for dir_name, m in zip(DIRECTIONS, self.members):
             self.add_item(TextInput(
                 label=f"{dir_name} {m.display_name} 점수",
@@ -39,7 +45,7 @@ class ScoreModal(Modal):
             ))
 
     async def on_submit(self, interaction: discord.Interaction):
-        # 정수 변환 및 합계 검증
+        # 1) 정수 변환 + 합계 검증
         scores: dict[int, int] = {}
         total = 0
         for i, m in enumerate(self.members):
@@ -55,41 +61,70 @@ class ScoreModal(Modal):
             total += val
 
         if total != 10000:
-            # 재입력 요구: 모달 내에서 바로 재오픈 불가 → 버튼을 통해 새 인터랙션으로 모달 재호출
             await interaction.response.send_message(
                 f"총합이 {total}점입니다. 10000점이 되어야 합니다. 다시 입력하세요.",
-                view=ReenterView(self.members),
+                view=ReenterView(self.members, self.pool),
                 ephemeral=True
             )
             return
 
-        # TODO: 저장 로직 삽입 (예: await save_scores(interaction.guild.id, scores))
-        await interaction.response.send_message(f"점수 저장됨: 합계 {total}", ephemeral=True)
+        # 2) DB 트랜잭션 저장: game 1건 + game_detail 4건
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.begin()
+                async with conn.cursor() as cur:
+                    # game: 기본값 삽입
+                    await cur.execute("INSERT INTO game () VALUES ()")
+                    game_id = cur.lastrowid
+
+                    # position: 0(east),1(west),2(south),3(north)
+                    inserts = []
+                    for pos, member in enumerate(self.members):
+                        uid = int(member.id)  # Discord snowflake
+                        sc = scores[uid]
+                        inserts.append((game_id, uid, sc, pos))
+
+                    await cur.executemany(
+                        "INSERT INTO game_detail (game_id, user_id, score, position) VALUES (%s, %s, %s, %s)",
+                        inserts
+                    )
+                await conn.commit()
+        except Exception as e:
+            # 롤백 및 에러 보고
+            try:
+                await conn.rollback()
+            except Exception:
+                pass
+            await interaction.response.send_message(f"DB 오류: {e}", ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            f"저장 완료. game_id={game_id}, 합계 {total}", ephemeral=True
+        )
 
 
 class ReenterView(View):
     """합계 불일치 시 재입력 버튼 제공."""
-    def __init__(self, members: List[discord.Member]):
+    def __init__(self, members: List[discord.Member], pool: aiomysql.Pool):
         super().__init__(timeout=120)
         self.members = members
+        self.pool = pool
         re_btn = Button(label="다시 입력", style=discord.ButtonStyle.primary)
 
         async def on_reenter(interaction: discord.Interaction):
-            await interaction.response.send_modal(ScoreModal(self.members))
+            await interaction.response.send_modal(ScoreModal(self.members, self.pool))
 
         re_btn.callback = on_reenter
         self.add_item(re_btn)
 
 
 class PagedPlayerSelectView(View):
-    """
-    역할 보유 사용자 목록을 페이지로 나눠 Select 제공.
-    - 선택은 현재 페이지에서 정확히 4명.
-    """
-    def __init__(self, members: List[discord.Member], per_page: int = PAGE_SIZE):
+    """역할 보유 사용자 목록을 페이지로 나눠 Select 제공. 현재 페이지에서 정확히 4명 선택."""
+    def __init__(self, members: List[discord.Member], pool: aiomysql.Pool, per_page: int = PAGE_SIZE):
         super().__init__(timeout=120)
         self.members = members
-        self.per_page = max(4, min(25, per_page))  # 안전 가드
+        self.pool = pool
+        self.per_page = max(4, min(25, per_page))  # Select 옵션 최대 25개/페이지
         self.page = 0
         self._rebuild()
 
@@ -106,10 +141,8 @@ class PagedPlayerSelectView(View):
         self.clear_items()
         page_members = self._slice()
 
-        # 현재 페이지 인원이 4명 미만이면 선택 UI 제공 불가
         if len(page_members) < 4:
-            info_btn = Button(label="이 페이지 인원이 4명 미만입니다.", disabled=True)
-            self.add_item(info_btn)
+            self.add_item(Button(label="이 페이지 인원이 4명 미만입니다.", disabled=True))
             self._add_pager()
             return
 
@@ -127,16 +160,13 @@ class PagedPlayerSelectView(View):
         )
 
         async def on_select(interaction: discord.Interaction):
-            # 선택값은 사용자 선택 순서대로 전달됨 → 동/서/남/북 매핑에 사용
             selected_ids = [int(v) for v in select.values]
             ordered = [interaction.guild.get_member(uid) for uid in selected_ids]
             ordered = [m for m in ordered if m is not None]
             if len(ordered) != 4:
-                await interaction.response.send_message(
-                    "정확히 4명을 선택해야 합니다.", ephemeral=True
-                )
+                await interaction.response.send_message("정확히 4명을 선택해야 합니다.", ephemeral=True)
                 return
-            await interaction.response.send_modal(ScoreModal(ordered))
+            await interaction.response.send_modal(ScoreModal(ordered, self.pool))
 
         select.callback = on_select
         self.add_item(select)
@@ -167,12 +197,26 @@ class PagedPlayerSelectView(View):
 class MyBot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
-        intents.members = True  # 멤버 목록 접근 필요
+        intents.members = True
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
+        self.db_pool: aiomysql.Pool | None = None
 
     async def setup_hook(self):
+        # aiomysql 풀 생성
+        self.db_pool = await aiomysql.create_pool(
+            host=DB_HOST, port=DB_PORT,
+            user=DB_USER, password=DB_PASSWORD, db=DB_NAME,
+            autocommit=False, minsize=1, maxsize=5,
+        )  # 기본 예제 패턴 참조. :contentReference[oaicite:1]{index=1}
         await self.tree.sync()
+
+    async def close(self):
+        # 풀 정리
+        if self.db_pool is not None:
+            self.db_pool.close()
+            await self.db_pool.wait_closed()
+        await super().close()
 
 bot = MyBot()
 
@@ -188,19 +232,22 @@ async def 점수입력(interaction: discord.Interaction):
         await interaction.response.send_message("길드에서만 사용할 수 있습니다.", ephemeral=True)
         return
 
+    # DB 풀 준비 확인
+    if bot.db_pool is None:
+        await interaction.response.send_message("DB 연결을 초기화하지 못했습니다.", ephemeral=True)
+        return
+
     role = discord.utils.get(guild.roles, name=ROLE_NAME)
     if role is None:
         await interaction.response.send_message(f"역할 '{ROLE_NAME}' 이(가) 없습니다.", ephemeral=True)
         return
 
     members = [m for m in guild.members if (role in m.roles and not m.bot)]
-
-    # 전체 인원 자체가 4명 미만이면 즉시 인원 부족 알림
     if len(members) < 4:
         await interaction.response.send_message("인원 부족: 최소 4명이 필요합니다.", ephemeral=True)
         return
 
-    view = PagedPlayerSelectView(members, per_page=PAGE_SIZE)
+    view = PagedPlayerSelectView(members, pool=bot.db_pool, per_page=PAGE_SIZE)
     if not view.children:
         await interaction.response.send_message("옵션이 부족하여 선택 UI를 만들 수 없습니다.", ephemeral=True)
         return
